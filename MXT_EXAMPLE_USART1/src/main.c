@@ -134,6 +134,9 @@ volatile uint32_t g_ul_value = 0;
 #define TASK_BUT_STACK_SIZE                (1024/sizeof(portSTACK_TYPE))
 #define TASK_BUT_STACK_PRIORITY            (tskIDLE_PRIORITY)
 
+#define TASK_CLOCK_STACK_SIZE                (1024/sizeof(portSTACK_TYPE))
+#define TASK_CLOCK_STACK_PRIORITY            (tskIDLE_PRIORITY)
+
 #define BUT_PIO           PIOD
 #define BUT_PIO_ID        ID_PIOD
 #define BUT_PIO_IDX       28u
@@ -171,6 +174,7 @@ QueueHandle_t xQueueTouch;
 QueueHandle_t xQueuebutt;
 QueueHandle_t xQueueafec;
 QueueHandle_t xQueuepwm;
+QueueHandle_t xQueueclock;
 
 
 SemaphoreHandle_t xSemaphore;
@@ -185,9 +189,10 @@ SemaphoreHandle_t xSemaphore2;
  */
 static void AFEC_Temp_callback(void)
 {
-	g_ul_value = afec_channel_get_value(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
-	xQueueSendFromISR(xQueueafec,&g_ul_value,0);
-	printf("%d\n", g_ul_value);
+	uint32_t temp;
+	temp = afec_channel_get_value(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
+	xQueueSendFromISR(xQueueafec,&temp,NULL);
+	
 }
 
 
@@ -394,18 +399,18 @@ void PWM0_init(uint channel, uint duty){
 
 void io_init(void)
 {
-	// Inicializa clock do perifÈrico PIO responsavel pelo botao
+	// Inicializa clock do perif√©rico PIO responsavel pelo botao
 	pmc_enable_periph_clk(BUT_PIO_ID);
 	pmc_enable_periph_clk(BUT2_PIO_ID);
 
-	// Configura PIO para lidar com o pino do bot„o como entrada
+	// Configura PIO para lidar com o pino do bot√£o como entrada
 	// com pull-up
 	pio_configure(BUT_PIO, PIO_INPUT, BUT_IDX_MASK, PIO_PULLUP | PIO_DEBOUNCE);
 	pio_configure(BUT2_PIO, PIO_INPUT, BUT2_IDX_MASK, PIO_PULLUP| PIO_DEBOUNCE);
 
-	// Configura interrupÁ„o no pino referente ao botao e associa
-	// funÁ„o de callback caso uma interrupÁ„o for gerada
-	// a funÁ„o de callback È a: but_callback()
+	// Configura interrup√ß√£o no pino referente ao botao e associa
+	// fun√ß√£o de callback caso uma interrup√ß√£o for gerada
+	// a fun√ß√£o de callback √© a: but_callback()
 	pio_handler_set(BUT_PIO,
 	BUT_PIO_ID,
 	BUT_IDX_MASK,
@@ -418,12 +423,12 @@ void io_init(void)
 	PIO_IT_FALL_EDGE,
 	but_callback2);
 
-	// Ativa interrupÁ„o
+	// Ativa interrup√ß√£o
 	pio_enable_interrupt(BUT_PIO, BUT_IDX_MASK);
 	pio_enable_interrupt(BUT2_PIO, BUT2_IDX_MASK);
 
 	// Configura NVIC para receber interrupcoes do PIO do botao
-	// com prioridade 4 (quanto mais prÛximo de 0 maior)
+	// com prioridade 4 (quanto mais pr√≥ximo de 0 maior)
 	NVIC_EnableIRQ(BUT_PIO_ID);
 	NVIC_SetPriority(BUT_PIO_ID, 4); // Prioridade 4
 	NVIC_EnableIRQ(BUT2_PIO_ID);
@@ -454,7 +459,7 @@ static void config_ADC_TEMP(void){
 	/* configura call back */
 	afec_set_callback(AFEC0, AFEC_INTERRUPT_EOC_0,	AFEC_Temp_callback, 5);
 
-	/*** Configuracao especÌfica do canal AFEC ***/
+	/*** Configuracao espec√≠fica do canal AFEC ***/
 	struct afec_ch_config afec_ch_cfg;
 	afec_ch_get_config_defaults(&afec_ch_cfg);
 	afec_ch_cfg.gain = AFEC_GAINVALUE_0;
@@ -473,7 +478,7 @@ static void config_ADC_TEMP(void){
 	afec_temp_sensor_get_config_defaults(&afec_temp_sensor_cfg);
 	afec_temp_sensor_set_config(AFEC0, &afec_temp_sensor_cfg);
 
-	/* Selecina canal e inicializa convers„o */
+	/* Selecina canal e inicializa convers√£o */
 	afec_channel_enable(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
 }
 
@@ -576,6 +581,21 @@ void task_mxt(void){
 	}
 }
 
+void task_clock(void){
+	xQueueclock=xQueueCreate(10,sizeof(int));
+	int sec=0;
+	while(1){
+		sec=sec+1;
+		if(sec==60){
+			sec=0;
+		}
+		xQueueSend(xQueueclock,&sec,0);
+		vTaskDelay(1000/portTICK_PERIOD_MS);
+	}
+	
+	
+}
+
 
 void task_lcd(void){
   xQueueTouch = xQueueCreate( 10, sizeof( touchData ) );
@@ -586,42 +606,56 @@ void task_lcd(void){
 	ili9488_draw_pixmap(240,25,soneca.width,soneca.height+2,soneca.data);
   
    // Escreve HH:MM no LCD
-   font_draw_text(&digital52, "12:50",83,ILI9488_LCD_HEIGHT/2-120, 1);
    font_draw_text(&digital52, "%",270,331, 1);
    //font_draw_text(&digital52, texto,210,331, 1);
    //font_draw_text(&digital52, texto,termometro.width-5,331, 1);
   
   touchData touch;
+  int sec;
+  int min=59;
+  int hora=5;
   char texto[32];
   char temp[32];
+  char sect[32];
   uint32_t nibe;
-   ili9488_set_foreground_color(COLOR_CONVERT(COLOR_RED));
-   ili9488_draw_filled_rectangle(10, 420,300 ,430);
+   
  
   
   
     
-  while (true) {  
-     if (xQueueReceive( xQueueTouch, &(touch), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
+  while (true) { 
+	  if (xQueueReceive( xQueueclock, &(sec), ( TickType_t )  10 / portTICK_PERIOD_MS)) {
+		  if(sec==0){
+			  min=min+1;
+		  }
+		  if(min==60){
+			  min=0;
+			  hora=hora+1;
+		  }
+		  if(hora==24){
+			  hora==0;
+		  }
+		  sprintf(sect, "%02d:%02d:%02d",hora,min,sec);
+		  font_draw_text(&digital52, sect,60,130, 1);
+		 
+	  }
+     if (xQueueReceive( xQueueTouch, &(touch), ( TickType_t )  10 / portTICK_PERIOD_MS)) {
        update_screen(touch.x, touch.y);
        printf("x:%d y:%d\n", touch.x, touch.y);
      }
-	  if (xQueueReceive( xQueuebutt, &(texto), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
+	  if (xQueueReceive( xQueuebutt, &(texto), ( TickType_t )  10 / portTICK_PERIOD_MS)) {
 		   ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
 		   ili9488_draw_filled_rectangle(179, 331,260 ,400);
-		  font_draw_text(&digital52, texto,210,331, 1);
+		  font_draw_text(&digital52, texto,180,331, 1);
 
 	  }
 	    if (xQueueReceive( xQueueafec, &(nibe), ( TickType_t )  10 / portTICK_PERIOD_MS)) {
-			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
-			ili9488_draw_filled_rectangle(50, 331, 150,400);
 			nibe=nibe*(100+1)/MAX_DIGITAL;
 			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
-			ili9488_draw_filled_rectangle(10, 420,300,430);
+			ili9488_draw_filled_rectangle((nibe*300/100), 420,310,430);
 			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_RED));
 			ili9488_draw_filled_rectangle(10, 420,(nibe*300/100),430);
-			xQueueSend(xQueuepwm, &nibe, 0);
-			sprintf(temp, "%d", nibe);
+			sprintf(temp, "%3d", nibe);
 		    font_draw_text(&digital52, temp,50,331, 1);
 
 	    }     
@@ -633,24 +667,27 @@ void task_afec(void){
   config_ADC_TEMP();
   
   while (true) {
-   // printf("Starting ADC\n");
+   // 
+   ("Starting ADC\n");
     afec_start_software_conversion(AFEC0);
-    vTaskDelay(1000);
+    vTaskDelay(10);
   }
 }
 
 void task_pwm(void){
-	 uint duty = 0;
-	 xQueuepwm= xQueueCreate( 10, sizeof( uint32_t ) );
+	 int duty = 0;
+	 xQueuepwm= xQueueCreate( 10, sizeof( int ) );
+	 pmc_enable_periph_clk(ID_PIO_PWM_0);
+	 pio_set_peripheral(PIO_PWM_0, PIO_PERIPH_A, MASK_PIN_PWM_0 );
 	 PWM0_init(0, duty);
 
 	 /* Infinite loop */
 	 while (1) {
-		 pwm_channel_update_duty(PWM0, &g_pwm_channel_led, 100-duty);
 	
 		  if (xQueueReceive( xQueuepwm, &(duty), ( TickType_t )  100 / portTICK_PERIOD_MS)) {
 			  pwm_channel_update_duty(PWM0, &g_pwm_channel_led, 100-duty);
 		  }
+		  
 	 }
 	
 }
@@ -679,16 +716,18 @@ static void task_but(void *pvParameters)
 		
 
 	for (;;) {
-		if( xSemaphoreTake(xSemaphore, ( TickType_t ) 500) == pdTRUE ){
-			a=a+1;
-			sprintf(texto, "%d", a);
+		if( xSemaphoreTake(xSemaphore, ( TickType_t ) 500) == pdTRUE && a<100 ){
+			a=a+10;
+			xQueueSend(xQueuepwm, &a, 0);
+			sprintf(texto, "%3d", a);
 			xQueueSend(xQueuebutt,&texto,0);
 			
 			
 		}
 		if( xSemaphoreTake(xSemaphore2, ( TickType_t ) 500) == pdTRUE && a>0 ){
-			a=a-1;
-			sprintf(texto, "%d", a);
+			a=a-10;
+			xQueueSend(xQueuepwm, &a, 0);
+			sprintf(texto, "%3d", a);
 			xQueueSend(xQueuebutt,&texto,0);
 			
 			
@@ -713,8 +752,7 @@ int main(void)
 
 	sysclk_init(); /* Initialize system clocks */
 	board_init();  /* Initialize board */
-	pmc_enable_periph_clk(ID_PIO_PWM_0);
-	pio_set_peripheral(PIO_PWM_0, PIO_PERIPH_A, MASK_PIN_PWM_0 );
+
 	
 	/* Initialize stdio on USART */
 	stdio_serial_init(USART_SERIAL_EXAMPLE, &usart_serial_options);
@@ -738,6 +776,9 @@ int main(void)
    TASK_BUT_STACK_PRIORITY, NULL);
    
    xTaskCreate(task_pwm, "pwm", TASK_BUT_STACK_SIZE, NULL,
+   TASK_BUT_STACK_PRIORITY, NULL);
+   
+   xTaskCreate(task_clock, "clock", TASK_BUT_STACK_SIZE, NULL,
    TASK_BUT_STACK_PRIORITY, NULL);
    
 
