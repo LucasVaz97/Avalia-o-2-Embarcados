@@ -8,22 +8,6 @@ src\ASF\sam\drivers\afec\afec.c
 
 src\ASF\sam\drivers\pwm\pwm.c
 
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\croutine.c
-
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\event_groups.c
-
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\list.c
-
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\portable\GCC\ARM_CM7\r0p1\port.c
-
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\portable\MemMang\heap_1.c
-
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\queue.c
-
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\tasks.c
-
-src\ASF\thirdparty\freertos\freertos-8.2.3\Source\timers.c
-
 src\ASF\common\components\touch\mxt\mxt_device_1.c
 
 src\ASF\common\services\clock\same70\sysclk.c
@@ -67,6 +51,22 @@ src\ASF\sam\utils\cmsis\same70\source\templates\gcc\startup_same70.c
 src\ASF\sam\utils\cmsis\same70\source\templates\system_same70.c
 
 src\ASF\sam\utils\syscalls\gcc\syscalls.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\croutine.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\event_groups.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\list.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\portable\GCC\ARM_CM7\r0p1\port.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\portable\MemMang\heap_1.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\queue.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\tasks.c
+
+src\ASF\thirdparty\freertos\freertos-8.2.3\Source\timers.c
 
 src\main.c
 

@@ -88,25 +88,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-
-#include "font_24.h"
 #include "conf_board.h"
 #include "conf_example.h"
 #include "conf_uart_serial.h"
+#include "tfont.h"
+#include "digital521.h"
+#include "termometro.h"
+#include "ar.h"
+#include "soneca.h"
 
+/************************************************************************/
+/* LCD + TOUCH                                                          */
+/************************************************************************/
 #define MAX_ENTRIES        3
-#define STRING_LENGTH     70
-
-#define TASK_MONITOR_STACK_SIZE            (2048/sizeof(portSTACK_TYPE))
-#define TASK_MONITOR_STACK_PRIORITY        (tskIDLE_PRIORITY)
-#define TASK_LED_STACK_SIZE                (1024/sizeof(portSTACK_TYPE))
-#define TASK_LED_STACK_PRIORITY            (tskIDLE_PRIORITY)
-#define TASK_PWM_STACK_SIZE                (1024/sizeof(portSTACK_TYPE))
-#define TASK_PWM_STACK_PRIORITY            (tskIDLE_PRIORITY)
-#define USART_TX_MAX_LENGTH     0xff
-
-
-
 
 struct ili9488_opt_t g_ili9488_display_opt;
 const uint32_t BUTTON_W = 120;
@@ -115,7 +109,30 @@ const uint32_t BUTTON_BORDER = 2;
 const uint32_t BUTTON_X = ILI9488_LCD_WIDTH/2;
 const uint32_t BUTTON_Y = ILI9488_LCD_HEIGHT/2;
 
+/************************************************************************/
+/* ADC                                                                  */
+/************************************************************************/
+/** The conversion data is done flag */
+volatile bool g_is_conversion_done = false;
 
+/** The conversion data value */
+volatile uint32_t g_ul_value = 0;
+
+/* Canal do sensor de temperatura */
+#define AFEC_CHANNEL_TEMP_SENSOR AFEC_CHANNEL_0
+#define MAX_DIGITAL     (4095UL)
+
+/************************************************************************/
+/* RTOS                                                                  */
+/************************************************************************/
+#define TASK_MXT_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
+#define TASK_MXT_STACK_PRIORITY        (tskIDLE_PRIORITY)  
+
+#define TASK_LCD_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
+#define TASK_LCD_STACK_PRIORITY        (tskIDLE_PRIORITY)
+
+#define TASK_BUT_STACK_SIZE                (1024/sizeof(portSTACK_TYPE))
+#define TASK_BUT_STACK_PRIORITY            (tskIDLE_PRIORITY)
 
 #define BUT_PIO           PIOD
 #define BUT_PIO_ID        ID_PIOD
@@ -127,25 +144,7 @@ const uint32_t BUTTON_Y = ILI9488_LCD_HEIGHT/2;
 #define BUT2_PIO_IDX       31u
 #define BUT2_IDX_MASK  (1u << BUT2_PIO_IDX)
 
-
-
-	
-/** RTOS  */
-#define TASK_MXT_STACK_SIZE            (2*1024/sizeof(portSTACK_TYPE))
-#define TASK_MXT_STACK_PRIORITY        (tskIDLE_PRIORITY)  
-
-volatile char texto[32];
-volatile char bt[32];
-
-
-
-/** PWM */
-
-#include "asf.h"
-#include "stdio_serial.h"
-#include "conf_board.h"
-#include "conf_clock.h"
-
+//PWM
 #define PIO_PWM_0 PIOA
 #define ID_PIO_PWM_0 ID_PIOA
 #define MASK_PIN_PWM_0 (1 << 0)
@@ -156,20 +155,59 @@ volatile char bt[32];
 #define PERIOD_VALUE       100
 /** Initial duty cycle value */
 #define INIT_DUTY_VALUE    0
-#define AFEC_CHANNEL_RES_PIN 5
 
 /** PWM channel instance for LEDs */
 pwm_channel_t g_pwm_channel_led;
-/** AFEC*/
-
-#define AFEC_CHANNEL_TEMP_SENSOR 11
 
 
+
+
+typedef struct {
+  uint x;
+  uint y;
+} touchData;
+
+QueueHandle_t xQueueTouch;
+QueueHandle_t xQueuebutt;
+QueueHandle_t xQueueafec;
+QueueHandle_t xQueuepwm;
+
+
+SemaphoreHandle_t xSemaphore;
+SemaphoreHandle_t xSemaphore2;
+
+/************************************************************************/
+/* handler/callbacks                                                    */
+/************************************************************************/
+
+/**
+ * \brief interrupt callback function.
+ */
+static void AFEC_Temp_callback(void)
+{
+	g_ul_value = afec_channel_get_value(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
+	xQueueSendFromISR(xQueueafec,&g_ul_value,0);
+	printf("%d\n", g_ul_value);
+}
+
+
+void but_callback(void){
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	printf("but_callback \n");
+	xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
+	printf("semafaro tx \n");
+}
+void but_callback2(void){
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	printf("but_callback2222 \n");
+	xSemaphoreGiveFromISR(xSemaphore2, &xHigherPriorityTaskWoken);
+	printf("semafaro tx2222 \n");
+}
 
 
 
 /************************************************************************/
-/* RTOS application funcs                                               */
+/* RTOS hooks                                                           */
 /************************************************************************/
 
 /**
@@ -213,6 +251,9 @@ extern void vApplicationMallocFailedHook(void)
 	configASSERT( ( volatile void * ) NULL );
 }
 
+/************************************************************************/
+/* init                                                                 */
+/************************************************************************/
 
 static void configure_lcd(void){
 	/* Initialize display parameter */
@@ -317,35 +358,136 @@ static void mxt_init(struct mxt_device *device)
 			MXT_GEN_COMMANDPROCESSOR_T6, 0)
 			+ MXT_GEN_COMMANDPROCESSOR_CALIBRATE, 0x01);
 }
+void PWM0_init(uint channel, uint duty){
+	/* Enable PWM peripheral clock */
+	pmc_enable_periph_clk(ID_PWM0);
+
+	/* Disable PWM channels for LEDs */
+	pwm_channel_disable(PWM0, PIN_PWM_LED0_CHANNEL);
+
+	/* Set PWM clock A as PWM_FREQUENCY*PERIOD_VALUE (clock B is not used) */
+	pwm_clock_t clock_setting = {
+		.ul_clka = PWM_FREQUENCY * PERIOD_VALUE,
+		.ul_clkb = 0,
+		.ul_mck = sysclk_get_peripheral_hz()
+	};
+	
+	pwm_init(PWM0, &clock_setting);
+
+	/* Initialize PWM channel for LED0 */
+	/* Period is left-aligned */
+	g_pwm_channel_led.alignment = PWM_ALIGN_CENTER;
+	/* Output waveform starts at a low level */
+	g_pwm_channel_led.polarity = PWM_HIGH;
+	/* Use PWM clock A as source clock */
+	g_pwm_channel_led.ul_prescaler = PWM_CMR_CPRE_CLKA;
+	/* Period value of output waveform */
+	g_pwm_channel_led.ul_period = PERIOD_VALUE;
+	/* Duty cycle value of output waveform */
+	g_pwm_channel_led.ul_duty = duty;
+	g_pwm_channel_led.channel = channel;
+	pwm_channel_init(PWM0, &g_pwm_channel_led);
+	
+	/* Enable PWM channels for LEDs */
+	pwm_channel_enable(PWM0, channel);
+}
+
+void io_init(void)
+{
+	// Inicializa clock do periférico PIO responsavel pelo botao
+	pmc_enable_periph_clk(BUT_PIO_ID);
+	pmc_enable_periph_clk(BUT2_PIO_ID);
+
+	// Configura PIO para lidar com o pino do botão como entrada
+	// com pull-up
+	pio_configure(BUT_PIO, PIO_INPUT, BUT_IDX_MASK, PIO_PULLUP | PIO_DEBOUNCE);
+	pio_configure(BUT2_PIO, PIO_INPUT, BUT2_IDX_MASK, PIO_PULLUP| PIO_DEBOUNCE);
+
+	// Configura interrupção no pino referente ao botao e associa
+	// função de callback caso uma interrupção for gerada
+	// a função de callback é a: but_callback()
+	pio_handler_set(BUT_PIO,
+	BUT_PIO_ID,
+	BUT_IDX_MASK,
+	PIO_IT_FALL_EDGE,
+	but_callback);
+	
+	pio_handler_set(BUT2_PIO,
+	BUT2_PIO_ID,
+	BUT2_IDX_MASK,
+	PIO_IT_FALL_EDGE,
+	but_callback2);
+
+	// Ativa interrupção
+	pio_enable_interrupt(BUT_PIO, BUT_IDX_MASK);
+	pio_enable_interrupt(BUT2_PIO, BUT2_IDX_MASK);
+
+	// Configura NVIC para receber interrupcoes do PIO do botao
+	// com prioridade 4 (quanto mais próximo de 0 maior)
+	NVIC_EnableIRQ(BUT_PIO_ID);
+	NVIC_SetPriority(BUT_PIO_ID, 4); // Prioridade 4
+	NVIC_EnableIRQ(BUT2_PIO_ID);
+	NVIC_SetPriority(BUT2_PIO_ID, 4);
+}
+
+
+
+static void config_ADC_TEMP(void){
+/*************************************
+   * Ativa e configura AFEC
+   *************************************/
+  /* Ativa AFEC - 0 */
+	afec_enable(AFEC0);
+
+	/* struct de configuracao do AFEC */
+	struct afec_config afec_cfg;
+
+	/* Carrega parametros padrao */
+	afec_get_config_defaults(&afec_cfg);
+
+	/* Configura AFEC */
+	afec_init(AFEC0, &afec_cfg);
+
+	/* Configura trigger por software */
+	afec_set_trigger(AFEC0, AFEC_TRIG_SW);
+
+	/* configura call back */
+	afec_set_callback(AFEC0, AFEC_INTERRUPT_EOC_0,	AFEC_Temp_callback, 5);
+
+	/*** Configuracao específica do canal AFEC ***/
+	struct afec_ch_config afec_ch_cfg;
+	afec_ch_get_config_defaults(&afec_ch_cfg);
+	afec_ch_cfg.gain = AFEC_GAINVALUE_0;
+	afec_ch_set_config(AFEC0, AFEC_CHANNEL_TEMP_SENSOR, &afec_ch_cfg);
+
+	/*
+	* Calibracao:
+	* Because the internal ADC offset is 0x200, it should cancel it and shift
+	 down to 0.
+	 */
+	afec_channel_set_analog_offset(AFEC0, AFEC_CHANNEL_TEMP_SENSOR, 0x200);
+
+	/***  Configura sensor de temperatura ***/
+	struct afec_temp_sensor_config afec_temp_sensor_cfg;
+
+	afec_temp_sensor_get_config_defaults(&afec_temp_sensor_cfg);
+	afec_temp_sensor_set_config(AFEC0, &afec_temp_sensor_cfg);
+
+	/* Selecina canal e inicializa conversão */
+	afec_channel_enable(AFEC0, AFEC_CHANNEL_TEMP_SENSOR);
+}
+
+
+/************************************************************************/
+/* funcoes                                                              */
+/************************************************************************/
 
 void draw_screen(void) {
 	ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
 	ili9488_draw_filled_rectangle(0, 0, ILI9488_LCD_WIDTH-1, ILI9488_LCD_HEIGHT-1);
 }
 
-static void AFEC_Res_callback(void)
-{
-	g_res_value = afec_channel_get_value(AFEC0, AFEC_CHANNEL_RES_PIN);
-	g_is_res_done = true;
-}
 
-
-
-void draw_button(uint32_t clicked) {
-	static uint32_t last_state = 255; // undefined
-	if(clicked == last_state) return;
-	
-	ili9488_set_foreground_color(COLOR_CONVERT(COLOR_BLACK));
-	ili9488_draw_filled_rectangle(BUTTON_X-BUTTON_W/2, BUTTON_Y-BUTTON_H/2, BUTTON_X+BUTTON_W/2, BUTTON_Y+BUTTON_H/2);
-	if(clicked) {
-		ili9488_set_foreground_color(COLOR_CONVERT(COLOR_TOMATO));
-		ili9488_draw_filled_rectangle(BUTTON_X-BUTTON_W/2+BUTTON_BORDER, BUTTON_Y+BUTTON_BORDER, BUTTON_X+BUTTON_W/2-BUTTON_BORDER, BUTTON_Y+BUTTON_H/2-BUTTON_BORDER);
-	} else {
-		ili9488_set_foreground_color(COLOR_CONVERT(COLOR_GREEN));
-		ili9488_draw_filled_rectangle(BUTTON_X-BUTTON_W/2+BUTTON_BORDER, BUTTON_Y-BUTTON_H/2+BUTTON_BORDER, BUTTON_X+BUTTON_W/2-BUTTON_BORDER, BUTTON_Y-BUTTON_BORDER);
-	}
-	last_state = clicked;
-}
 
 uint32_t convert_axis_system_x(uint32_t touch_y) {
 	// entrada: 4096 - 0 (sistema de coordenadas atual)
@@ -359,224 +501,174 @@ uint32_t convert_axis_system_y(uint32_t touch_x) {
 	return ILI9488_LCD_HEIGHT*touch_x/4096;
 }
 
-
-
 void update_screen(uint32_t tx, uint32_t ty) {
-	if(tx >= BUTTON_X-BUTTON_W/2 && tx <= BUTTON_X + BUTTON_W/2) {
-		if(ty >= BUTTON_Y-BUTTON_H/2 && ty <= BUTTON_Y) {
-			draw_button(1);
-		} else if(ty > BUTTON_Y && ty < BUTTON_Y + BUTTON_H/2) {
-			draw_button(0);
-		}
-	}
+	
 }
 
+void font_draw_text(tFont *font, const char *text, int x, int y, int spacing) {
+  char *p = text;
+  while(*p != NULL) {
+    char letter = *p;
+    int letter_offset = letter - font->start_char;
+    if(letter <= font->end_char) {
+      tChar *current_char = font->chars + letter_offset;
+      ili9488_draw_pixmap(x, y, current_char->image->width, current_char->image->height, current_char->image->data);
+      x += current_char->image->width + spacing;
+    }
+    p++;
+  }
+}
 
-void mxt_handler(struct mxt_device *device)
+void mxt_handler(struct mxt_device *device, uint *x, uint *y)
 {
 	/* USART tx buffer initialized to 0 */
-	char tx_buf[STRING_LENGTH * MAX_ENTRIES] = {0};
 	uint8_t i = 0; /* Iterator */
 
 	/* Temporary touch event data struct */
 	struct mxt_touch_event touch_event;
+  
+  /* first touch only */
+  uint first = 0;
 
 	/* Collect touch events and put the data in a string,
 	 * maximum 2 events at the time */
 	do {
-		/* Temporary buffer for each new touch event line */
-		char buf[STRING_LENGTH];
-	
+
 		/* Read next next touch event in the queue, discard if read fails */
 		if (mxt_read_touch_event(device, &touch_event) != STATUS_OK) {
 			continue;
 		}
 		
-		 // eixos trocados (quando na vertical LCD)
-		uint32_t conv_x = convert_axis_system_x(touch_event.y);
-		uint32_t conv_y = convert_axis_system_y(touch_event.x);
-		
-		/* Format a new entry in the data string that will be sent over USART */
-		sprintf(buf, "Nr: %1d, X:%4d, Y:%4d, Status:0x%2x conv X:%3d Y:%3d\n\r",
-				touch_event.id, touch_event.x, touch_event.y,
-				touch_event.status, conv_x, conv_y);
-		update_screen(conv_x, conv_y);
-
-		/* Add the new string to the string buffer */
-		strcat(tx_buf, buf);
+    /************************************************************************/
+    /* Envia dados via fila RTOS                                            */
+    /************************************************************************/
+    if(first == 0 ){
+      *x = convert_axis_system_x(touch_event.y);
+      *y = convert_axis_system_y(touch_event.x);
+      first = 1;
+    }
+    
 		i++;
 
 		/* Check if there is still messages in the queue and
 		 * if we have reached the maximum numbers of events */
 	} while ((mxt_is_message_pending(device)) & (i < MAX_ENTRIES));
+}
 
-	/* If there is any entries in the buffer, send them over USART */
-	if (i > 0) {
-		usart_serial_write_packet(USART_SERIAL_EXAMPLE, (uint8_t *)tx_buf, strlen(tx_buf));
+/************************************************************************/
+/* tasks                                                                */
+/************************************************************************/
+
+void task_mxt(void){
+  
+  	struct mxt_device device; /* Device data container */
+  	mxt_init(&device);       	/* Initialize the mXT touch device */
+    touchData touch;          /* touch queue data type*/
+    
+  	while (true) {  
+		  /* Check for any pending messages and run message handler if any
+		   * message is found in the queue */
+		  if (mxt_is_message_pending(&device)) {
+		  	mxt_handler(&device, &touch.x, &touch.y);
+        xQueueSend( xQueueTouch, &touch, 0);           /* send mesage to queue */
+      }
+     vTaskDelay(100);
 	}
 }
-void font_draw_text(tFont *font, const char *text, int x, int y, int spacing) {
-	char *p = text;
-	
-	while(*p != NULL) {
-		char letter = *p;
-		int letter_offset = letter - font->start_char;
-		
-		if(letter <= font->end_char) {
-			tChar *current_char = font->chars + letter_offset;
-			ili9488_draw_pixmap(x, y, current_char->image->width, current_char->image->height, current_char->image->data);
-			x += current_char->image->width + spacing;
-		}
-		p++;
-	}
-}
-
-/** Semaforo a ser usado pela task led */
-SemaphoreHandle_t xSemaphore;
-SemaphoreHandle_t xSemaphore2;
-
-/**
- * callback do botao
- * libera semaforo: xSemaphore
- */
-void but_callback(void){
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	printf("but_callback \n");
-	xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
-	printf("semafaro tx \n");
-}
-void but_callback2(void){
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	printf("but_callback2222 \n");
-	xSemaphoreGiveFromISR(xSemaphore2, &xHigherPriorityTaskWoken);
-	printf("semafaro tx2222 \n");
-}
 
 
-
-
-
-
-
-
-// Inicializa botao SW0 do kit com interrupcao
-void io_init(void)
-{
-  // Inicializa clock do periférico PIO responsavel pelo botao
-  pmc_enable_periph_clk(BUT_PIO_ID);
-  pmc_enable_periph_clk(BUT2_PIO_ID);
-
-  // Configura PIO para lidar com o pino do botão como entrada
-  // com pull-up
-  pio_configure(BUT_PIO, PIO_INPUT, BUT_IDX_MASK, PIO_PULLUP);
-  pio_configure(BUT2_PIO, PIO_INPUT, BUT2_IDX_MASK, PIO_PULLUP);
-
-  // Configura interrupção no pino referente ao botao e associa
-  // função de callback caso uma interrupção for gerada
-  // a função de callback é a: but_callback()
-  pio_handler_set(BUT_PIO,
-  BUT_PIO_ID,
-  BUT_IDX_MASK,
-  PIO_IT_FALL_EDGE,
-  but_callback);
+void task_lcd(void){
+  xQueueTouch = xQueueCreate( 10, sizeof( touchData ) );
+	configure_lcd();
+	draw_screen();
+	ili9488_draw_pixmap(53,230,termometro.width,termometro.height+2,termometro.data);
+	ili9488_draw_pixmap(ILI9488_LCD_WIDTH-43-ar.width,250,ar.width,ar.height+2,ar.data);
+	ili9488_draw_pixmap(240,25,soneca.width,soneca.height+2,soneca.data);
   
-  pio_handler_set(BUT2_PIO,
-  BUT2_PIO_ID,
-  BUT2_IDX_MASK,
-  PIO_IT_FALL_EDGE,
-  but_callback2);
-
-  // Ativa interrupção
-  pio_enable_interrupt(BUT_PIO, BUT_IDX_MASK);
-  pio_enable_interrupt(BUT2_PIO, BUT2_IDX_MASK);
-
-  // Configura NVIC para receber interrupcoes do PIO do botao
-  // com prioridade 4 (quanto mais próximo de 0 maior)
-  NVIC_EnableIRQ(BUT_PIO_ID);
-  NVIC_SetPriority(BUT_PIO_ID, 4); // Prioridade 4
-  NVIC_EnableIRQ(BUT2_PIO_ID);
-  NVIC_SetPriority(BUT2_PIO_ID, 4);
-}
-
-void PWM0_init(uint channel, uint duty){
-  /* Enable PWM peripheral clock */
-  pmc_enable_periph_clk(ID_PWM0);
-
-  /* Disable PWM channels for LEDs */
-  pwm_channel_disable(PWM0, PIN_PWM_LED0_CHANNEL);
-
-  /* Set PWM clock A as PWM_FREQUENCY*PERIOD_VALUE (clock B is not used) */
-  pwm_clock_t clock_setting = {
-    .ul_clka = PWM_FREQUENCY * PERIOD_VALUE,
-    .ul_clkb = 0,
-    .ul_mck = sysclk_get_peripheral_hz()
-  };
+   // Escreve HH:MM no LCD
+   font_draw_text(&digital52, "12:50",83,ILI9488_LCD_HEIGHT/2-120, 1);
+   font_draw_text(&digital52, "%",270,331, 1);
+   //font_draw_text(&digital52, texto,210,331, 1);
+   //font_draw_text(&digital52, texto,termometro.width-5,331, 1);
   
-  pwm_init(PWM0, &clock_setting);
-
-  /* Initialize PWM channel for LED0 */
-  /* Period is left-aligned */
-  g_pwm_channel_led.alignment = PWM_ALIGN_CENTER;
-  /* Output waveform starts at a low level */
-  g_pwm_channel_led.polarity = PWM_HIGH;
-  /* Use PWM clock A as source clock */
-  g_pwm_channel_led.ul_prescaler = PWM_CMR_CPRE_CLKA;
-  /* Period value of output waveform */
-  g_pwm_channel_led.ul_period = PERIOD_VALUE;
-  /* Duty cycle value of output waveform */
-  g_pwm_channel_led.ul_duty = duty;
-  g_pwm_channel_led.channel = channel;
-  pwm_channel_init(PWM0, &g_pwm_channel_led);
+  touchData touch;
+  char texto[32];
+  char temp[32];
+  uint32_t nibe;
+   ili9488_set_foreground_color(COLOR_CONVERT(COLOR_RED));
+   ili9488_draw_filled_rectangle(10, 420,300 ,430);
  
-  /* Enable PWM channels for LEDs */
-  pwm_channel_enable(PWM0, channel);
+  
+  
+    
+  while (true) {  
+     if (xQueueReceive( xQueueTouch, &(touch), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
+       update_screen(touch.x, touch.y);
+       printf("x:%d y:%d\n", touch.x, touch.y);
+     }
+	  if (xQueueReceive( xQueuebutt, &(texto), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
+		   ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
+		   ili9488_draw_filled_rectangle(179, 331,260 ,400);
+		  font_draw_text(&digital52, texto,210,331, 1);
+
+	  }
+	    if (xQueueReceive( xQueueafec, &(nibe), ( TickType_t )  10 / portTICK_PERIOD_MS)) {
+			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
+			ili9488_draw_filled_rectangle(50, 331, 150,400);
+			nibe=nibe*(100+1)/MAX_DIGITAL;
+			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
+			ili9488_draw_filled_rectangle(10, 420,300,430);
+			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_RED));
+			ili9488_draw_filled_rectangle(10, 420,(nibe*300/100),430);
+			xQueueSend(xQueuepwm, &nibe, 0);
+			sprintf(temp, "%d", nibe);
+		    font_draw_text(&digital52, temp,50,331, 1);
+
+	    }     
+  }	 
 }
 
-/**
- * \brief Application entry point for PWM with LED example.
- * Output PWM waves on LEDs to make them fade in and out.
- */
+void task_afec(void){
+ xQueueafec= xQueueCreate( 10, sizeof( uint32_t ) );
+  config_ADC_TEMP();
+  
+  while (true) {
+   // printf("Starting ADC\n");
+    afec_start_software_conversion(AFEC0);
+    vTaskDelay(1000);
+  }
+}
 
-
-/**
- * \brief This task, when activated, make LED blink at a fixed rate
- */
-
-static void task_pwm(void *pvParameters){
+void task_pwm(void){
 	 uint duty = 0;
-	 const TickType_t xDelay = 10 / portTICK_PERIOD_MS;
+	 xQueuepwm= xQueueCreate( 10, sizeof( uint32_t ) );
 	 PWM0_init(0, duty);
 
 	 /* Infinite loop */
 	 while (1) {
-		 /* fade in */
-		 for(duty = 0; duty <= 100; duty++){
-			 pwm_channel_update_duty(PWM0, &g_pwm_channel_led, 100-duty);
-			 vTaskDelay(xDelay);
-		 }
-		 /* fade out*/
-		 for(duty = 0; duty <= 100; duty++){
-			 pwm_channel_update_duty(PWM0, &g_pwm_channel_led, duty);
-			 vTaskDelay(xDelay);
-		 }
+		 pwm_channel_update_duty(PWM0, &g_pwm_channel_led, 100-duty);
+	
+		  if (xQueueReceive( xQueuepwm, &(duty), ( TickType_t )  100 / portTICK_PERIOD_MS)) {
+			  pwm_channel_update_duty(PWM0, &g_pwm_channel_led, 100-duty);
+		  }
 	 }
+	
 }
 
 
-static void task_led(void *pvParameters)
+
+static void task_but(void *pvParameters)
 {
         /* We are using the semaphore for synchronisation so we create a binary
         semaphore rather than a mutex.  We must make sure that the interrupt
         does not attempt to use the semaphore before it is created! */
+	char texto[32];
+	int a = 50;
 	xSemaphore = xSemaphoreCreateBinary();
 	xSemaphore2 = xSemaphoreCreateBinary();
-	
-	int a =0;
-	sprintf(texto, "%d", a);
-	
-	
-	
+	xQueuebutt = xQueueCreate( 10, sizeof( texto ) );
 
+	
         /* devemos iniciar a interrupcao no pino somente apos termos alocado
            os recursos (no caso semaforo), nessa funcao inicializamos 
            o botao e seu callback*/
@@ -584,47 +676,33 @@ static void task_led(void *pvParameters)
 
 	if (xSemaphore == NULL)
 		printf("falha em criar o semaforo \n");
+		
 
 	for (;;) {
 		if( xSemaphoreTake(xSemaphore, ( TickType_t ) 500) == pdTRUE ){
 			a=a+1;
-			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
-			ili9488_draw_filled_rectangle(10,10,80,90);
 			sprintf(texto, "%d", a);
-			font_draw_text(&font_24, texto, 10, 10, 1);
+			xQueueSend(xQueuebutt,&texto,0);
+			
+			
 		}
 		if( xSemaphoreTake(xSemaphore2, ( TickType_t ) 500) == pdTRUE && a>0 ){
 			a=a-1;
-			ili9488_set_foreground_color(COLOR_CONVERT(COLOR_WHITE));
-			ili9488_draw_filled_rectangle(10,10,80,90);
 			sprintf(texto, "%d", a);
-			font_draw_text(&font_24, texto, 10, 10, 1);
+			xQueueSend(xQueuebutt,&texto,0);
+			
+			
 		}
 	}
 }
 
-void task_mxt(void){
-  
-  	struct mxt_device device; /* Device data container */
 
-  	/* Initialize the mXT touch device */
-  	mxt_init(&device);
-    
-  	while (true) {  
-		  /* Check for any pending messages and run message handler if any
-		   * message is found in the queue */
-		  
-		  if (mxt_is_message_pending(&device)) {
-		  	mxt_handler(&device);
-        //vTaskDelay(100);
-      }
-	}
-}
-
+/************************************************************************/
+/* main                                                                 */
+/************************************************************************/
 
 int main(void)
 {
-
 	/* Initialize the USART configuration struct */
 	const usart_serial_options_t usart_serial_options = {
 		.baudrate     = USART_SERIAL_EXAMPLE_BAUDRATE,
@@ -637,32 +715,39 @@ int main(void)
 	board_init();  /* Initialize board */
 	pmc_enable_periph_clk(ID_PIO_PWM_0);
 	pio_set_peripheral(PIO_PWM_0, PIO_PERIPH_A, MASK_PIN_PWM_0 );
-	configure_lcd();
-	draw_screen();
-	draw_button(0);
-
+	
 	/* Initialize stdio on USART */
 	stdio_serial_init(USART_SERIAL_EXAMPLE, &usart_serial_options);
-
-	printf("\n\rmaXTouch data USART transmitter\n\r");
 		
-  /* Create task to make led blink */
+  /* Create task to handler touch */
   if (xTaskCreate(task_mxt, "mxt", TASK_MXT_STACK_SIZE, NULL, TASK_MXT_STACK_PRIORITY, NULL) != pdPASS) {
     printf("Failed to create test led task\r\n");
   }
-  xTaskCreate(task_led, "Led", TASK_LED_STACK_SIZE, NULL,
-  TASK_LED_STACK_PRIORITY, NULL);
   
-  xTaskCreate(task_pwm, "pwm", TASK_PWM_STACK_SIZE, NULL,
-  TASK_PWM_STACK_PRIORITY, NULL);
+  /* Create task to handler LCD */
+  if (xTaskCreate(task_lcd, "lcd", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
+    printf("Failed to create test led task\r\n");
+  }
   
+   /* Create task to handler LCD */
+   if (xTaskCreate(task_afec, "afec", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
+     printf("Failed to create test led task\r\n");
+   }
+   
+   xTaskCreate(task_but, "Butums", TASK_BUT_STACK_SIZE, NULL,
+   TASK_BUT_STACK_PRIORITY, NULL);
+   
+   xTaskCreate(task_pwm, "pwm", TASK_BUT_STACK_SIZE, NULL,
+   TASK_BUT_STACK_PRIORITY, NULL);
+   
 
   /* Start the scheduler. */
   vTaskStartScheduler();
 
   while(1){
-	
+
   }
+
 
 	return 0;
 }
